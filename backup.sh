@@ -1,141 +1,250 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# misskey-backup v2
+# PostgreSQL (Misskey) ダンプ → Google Drive アップロード → 通知 → 世代削除
+#
+# 設定はスクリプトと同じディレクトリ (または /etc/misskey-backup) の
+# backup.env から読み込みます。backup.env.example をコピーして使ってください。
 
-# USER CONFIGURATION
+set -o errexit
+set -o pipefail
+set -o nounset
+set -o errtrace
+
+# ---------------------------------------------------------------------------
+# 設定の読み込み
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+CONFIG_FILE="${CONFIG_FILE:-}"
+if [[ -z "$CONFIG_FILE" ]]; then
+    for candidate in "$SCRIPT_DIR/backup.env" "/etc/misskey-backup/backup.env"; do
+        if [[ -f "$candidate" ]]; then
+            CONFIG_FILE="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$CONFIG_FILE" ]]; then
+    echo "エラー: 設定ファイルが見つかりません。" >&2
+    echo "backup.env.example を backup.env としてコピーし、値を設定してください。" >&2
+    exit 2
+fi
+
+# 設定ファイル内の値で未設定の変数のみ埋める（スクリプトのデフォルトを上書きしない）
 DB_USER="user"
 DB_NAME="misskey"
 DOCKER_CONTAINER_NAME="misskey-db-1"
 BACKUP_DIR="/home/misskey/backup"
-MISSKEY_INSTANCE="https://example.com"
-MISSKEY_TOKEN="token"
-DISCORD_WEBHOOK_URL="webhook"
-GDRIVE_PARENT_ID="id"
+MISSKEY_INSTANCE=""
+MISSKEY_TOKEN=""
+DISCORD_WEBHOOK_URL=""
+GDRIVE_PARENT_ID=""
 GDRIVE_PATH="./gdrive"
+RETENTION_DAYS=14
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
 
-# TIMESTAMP
-TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+# ---------------------------------------------------------------------------
+# ログとエラーハンドリング
+# ---------------------------------------------------------------------------
+TIMESTAMP="$(date +%Y%m%d%H%M%S)"
 BACKUP_FILE="${BACKUP_DIR}/${DB_NAME}_backup_${TIMESTAMP}.sql"
+LOG_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.log"
+ERROR_MESSAGE=""
 
-# ERROR HANDLING
-set -o errexit
-set -o pipefail
-set -o nounset
+mkdir -p "$BACKUP_DIR"
+exec 3>&1 1> >(tee -a "$LOG_FILE") 2>&1
 
-# FUNCTIONS
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    ERROR_MESSAGE="行 ${line_no} でエラーが発生しました (exit code: ${exit_code})"
+    log "エラー: $ERROR_MESSAGE"
+    log "--- エラーログ ---"
+    cat "$LOG_FILE" >&2
+    notify_error "$ERROR_MESSAGE"
+    exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
+# ---------------------------------------------------------------------------
+# 二重起動防止（同一ホストで同時実行しない）
+# ---------------------------------------------------------------------------
+LOCK_FILE="${BACKUP_DIR}/backup.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "エラー: 別のバックアップが実行中です ($LOCK_FILE)"
+    exit 3
+fi
+
+# ---------------------------------------------------------------------------
+# 通知
+# ---------------------------------------------------------------------------
+post_json() {
+    local url="$1" payload="$2"
+    # 通知の失敗でバックアップ全体を止めない
+    curl -sf -m 30 -H "Content-Type: application/json" \
+        -X POST -d "$payload" "$url" >/dev/null || \
+        log "警告: 通知の送信に失敗しました (${url})"
+}
+
+notify_discord() {
+    local message="$1"
+    if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+        # JSON エスケープ（改行・引用符）
+        local escaped
+        escaped=$(printf '%s' "$message" | jq -Rs .)
+        post_json "$DISCORD_WEBHOOK_URL" "{\"content\": ${escaped}}"
+    fi
+}
+
+notify_misskey() {
+    local message="$1"
+    if [[ -n "$MISSKEY_INSTANCE" && -n "$MISSKEY_TOKEN" ]]; then
+        local escaped
+        escaped=$(printf '%s' "$message" | jq -Rs .)
+        post_json "$MISSKEY_INSTANCE/api/notes/create" \
+            "{\"i\": \"${MISSKEY_TOKEN}\", \"text\": ${escaped}, \"localOnly\": true, \"visibility\": \"home\"}"
+    fi
+}
+
 notify_start() {
-    curl -H "Content-Type: application/json" -X POST -d "{\"content\": \"📌 データベースのバックアップを開始します。\"}" "$DISCORD_WEBHOOK_URL"
-    curl -X POST -H "Content-Type: application/json" -d "{
-        \"i\": \"$MISSKEY_TOKEN\",
-        \"text\": \"📌 データベースのバックアップを開始します。\",
-        \"localOnly\": true,
-        \"visibility\": \"home\"
-    }" "$MISSKEY_INSTANCE/api/notes/create"
+    log "バックアップを開始します"
+    notify_discord "📌 データベースのバックアップを開始します。"
+    notify_misskey "📌 データベースのバックアップを開始します。"
 }
 
-create_backup() {
-    mkdir -p "$BACKUP_DIR"
-    docker exec "$DOCKER_CONTAINER_NAME" pg_dump -U "$DB_USER" "$DB_NAME" > "$BACKUP_FILE"
+notify_error() {
+    local message="$1"
+    notify_discord "⚠️ バックアップ中にエラーが発生しました。
+エラー内容: ${message}
+詳細はサーバーのログを確認してください。"
+    notify_misskey "⚠️ バックアップ中にエラーが発生しました。
+エラー内容: ${message}"
 }
 
+# ---------------------------------------------------------------------------
+# バックアップ本体
+# ---------------------------------------------------------------------------
 get_file_size() {
     local file_path="$1"
-    if [ -f "$file_path" ]; then
+    if [[ -f "$file_path" ]]; then
         stat -c "%s" "$file_path"
     else
         echo 0
     fi
 }
 
-calculate_size_diff() {
-    local last_backup_size=$(get_file_size "$LAST_BACKUP")
-    local current_size=$(get_file_size "$BACKUP_FILE")
-    echo $(($current_size - $last_backup_size))
+create_backup() {
+    log "pg_dump を実行しています..."
+
+    if ! docker inspect "$DOCKER_CONTAINER_NAME" >/dev/null 2>&1; then
+        log "エラー: コンテナ '$DOCKER_CONTAINER_NAME' が見つかりません"
+        return 1
+    fi
+
+    # 一時ファイルに書き込み、検証してから確定させる（失敗時に中途半端なファイルを残さない）
+    local tmp_file="${BACKUP_FILE}.tmp"
+
+    if ! docker exec "$DOCKER_CONTAINER_NAME" pg_dump -U "$DB_USER" "$DB_NAME" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # ダンプの整合性チェック: ヘッダとフッタを確認
+    if ! head -n 2 "$tmp_file" | grep -q "PostgreSQL database dump"; then
+        log "エラー: ダンプファイルのヘッダが不正です"
+        rm -f "$tmp_file"
+        return 1
+    fi
+    if ! tail -n 5 "$tmp_file" | grep -q "PostgreSQL database dump complete"; then
+        log "エラー: ダンプが完了していません（フッタが不正）"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # 圧縮して保存容量を削減（必要なければ COMPRESS_DUMP=0）
+    if [[ "${COMPRESS_DUMP:-1}" == "1" ]]; then
+        gzip -f "$tmp_file"
+        mv "${tmp_file}.gz" "$BACKUP_FILE.gz"
+        BACKUP_FILE="${BACKUP_FILE}.gz"
+    else
+        mv "$tmp_file" "$BACKUP_FILE"
+    fi
+    log "バックアップ完了: $BACKUP_FILE ($(get_file_size "$BACKUP_FILE") bytes)"
 }
 
+# ---------------------------------------------------------------------------
+# Google Drive へのアップロード
+# ---------------------------------------------------------------------------
 upload_to_gdrive() {
     local backup_file="$1"
-    $GDRIVE_PATH files upload --parent "$GDRIVE_PARENT_ID" "$backup_file"
+
+    if [[ ! -x "$GDRIVE_PATH" && ! -x "$(command -v gdrive || true)" ]]; then
+        log "エラー: gdrive コマンドが見つかりません (GDRIVE_PATH=$GDRIVE_PATH)"
+        return 1
+    fi
+
+    log "Google Drive にアップロードしています..."
+    local gdrive_output
+    if ! gdrive_output=$("$GDRIVE_PATH" files upload --parent "$GDRIVE_PARENT_ID" "$backup_file" 2>&1); then
+        log "gdrive の出力: $gdrive_output"
+        return 1
+    fi
+    GDRIVE_OUTPUT="$gdrive_output"
 }
 
-parse_gdrive_output() {
-    local output="$1"
-    local created_time=$(echo "$output" | grep "Created:" | awk '{print $2" "$3}')
-    local view_url=$(echo "$output" | grep "ViewUrl:" | awk '{print $2}')
-    echo "$created_time"
-    echo "$view_url"
-}
-
-notify_success() {
-    local size_diff="$1"
-    local created_time="$2"
-    local view_url="$3"
-    curl -H "Content-Type: application/json" -X POST -d "{
-        \"content\": \"✅ データベースのバックアップが完了しました。\\n前回との差分サイズ: ${size_diff} バイト\\n作成日時: ${created_time}\\nダウンロードURL: ${view_url}\"
-    }" "$DISCORD_WEBHOOK_URL"
-    curl -X POST -H "Content-Type: application/json" -d "{
-        \"i\": \"$MISSKEY_TOKEN\",
-        \"text\": \"✅ データベースのバックアップが完了しました。\\n前回との差分サイズ: ${size_diff} バイト\\n作成日時: ${created_time}\",
-        \"localOnly\": true,
-        \"visibility\": \"home\"
-    }" "$MISSKEY_INSTANCE/api/notes/create"
-}
-
+# ---------------------------------------------------------------------------
+# 世代管理
+# ---------------------------------------------------------------------------
 clean_old_backups() {
-    local backup_dir="$1"
-    local days_to_keep=14
-    echo "🧹 Cleaning up old backup files older than $days_to_keep days..."
-    find "$backup_dir" -type f -name "${DB_NAME}_backup_*.sql" -mtime "+$days_to_keep" -delete
+    log "${RETENTION_DAYS} 日より古いバックアップを削除しています..."
+    find "$BACKUP_DIR" -type f \
+        \( -name "${DB_NAME}_backup_*.sql" -o -name "${DB_NAME}_backup_*.sql.gz" \) \
+        -mtime "+${RETENTION_DAYS}" -delete
+    log "クリーンアップ完了"
 }
 
-notify_cleanup() {
-    curl -H "Content-Type: application/json" -X POST -d "{
-        \"content\": \"🧹 オールドバックアップクリーンアップ完了。\"
-    }" "$DISCORD_WEBHOOK_URL"
-    curl -X POST -H "Content-Type: application/json" -d "{
-        \"i\": \"$MISSKEY_TOKEN\",
-        \"text\": \"🧹 オールドバックアップクリーンアップ完了。\",
-        \"localOnly\": true,
-        \"visibility\": \"home\"
-    }" "$MISSKEY_INSTANCE/api/notes/create"
-}
+# ---------------------------------------------------------------------------
+# メイン処理
+# ---------------------------------------------------------------------------
+main() {
+    # 前回バックアップのサイズ（新規作成前に取得する）
+    local last_backup=""
+    last_backup=$(ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql* 2>/dev/null | head -n 1 || true)
+    local last_size=0
+    [[ -n "$last_backup" ]] && last_size=$(get_file_size "$last_backup")
 
-error_handler() {
-    local error_message="$1"
-    curl -H "Content-Type: application/json" -X POST -d "{
-        \"content\": \"⚠️ バックアップ中にエラーが発生しました。\\nエラー内容: ${error_message}\"
-    }" "$DISCORD_WEBHOOK_URL"
-    curl -X POST -H "Content-Type: application/json" -d "{
-        \"i\": \"$MISSKEY_TOKEN\",
-        \"text\": \"⚠️ バックアップ中にエラーが発生しました。\\nエラー内容: ${error_message}\",
-        \"localOnly\": true,
-        \"visibility\": \"home\"
-    }" "$MISSKEY_INSTANCE/api/notes/create"
-}
+    notify_start
 
-# MAIN EXECUTION
-notify_start
-
-{
-    # Create backup
     create_backup
 
-    # Get file sizes
-    LAST_BACKUP=$(ls -t "$BACKUP_DIR/${DB_NAME}_backup_*.sql" 2>/dev/null | grep -v "$TIMESTAMP" | head -n 1)
-    SIZE_DIFF=$(calculate_size_diff)
+    local current_size
+    current_size=$(get_file_size "$BACKUP_FILE")
+    local size_diff=$((current_size - last_size))
 
-    # Upload to Google Drive
-    GDRIVE_OUTPUT=$(upload_to_gdrive "$BACKUP_FILE")
-    CREATED_TIME=$(parse_gdrive_output "$GDRIVE_OUTPUT" | head -n 1)
-    VIEW_URL=$(parse_gdrive_output "$GDRIVE_OUTPUT" | tail -n 1)
+    upload_to_gdrive "$BACKUP_FILE"
 
-    # Notify success
-    notify_success "$SIZE_DIFF" "$CREATED_TIME" "$VIEW_URL"
+    # gdrive の出力から作成日時を抽出
+    local created_time
+    created_time=$(echo "$GDRIVE_OUTPUT" | grep "Created:" | awk '{print $2" "$3}')
 
-    # Clean old backups
-    clean_old_backups "$BACKUP_DIR"
-    notify_cleanup
-} || {
-    # Handle errors
-    ERROR_MESSAGE=$(cat "/tmp/backup_error.log")
-    error_handler "$ERROR_MESSAGE"
-    exit 1
-} 2> "/tmp/backup_error.log"
+    notify_discord "✅ データベースのバックアップが完了しました。
+前回との差分サイズ: ${size_diff} バイト
+作成日時: ${created_time}"
+    notify_misskey "✅ データベースのバックアップが完了しました。
+前回との差分サイズ: ${size_diff} バイト
+作成日時: ${created_time}"
+
+    clean_old_backups
+
+    log "すべての処理が完了しました"
+}
+
+main
