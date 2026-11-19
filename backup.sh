@@ -47,7 +47,8 @@ HEALTHCHECK_URL=""
 GDRIVE_PARENT_ID=""
 GDRIVE_PATH="./gdrive"
 RETENTION_DAYS=14
-DRY_RUN=0
+# 環境変数で上書きできる項目は :- デフォルト形式にする
+DRY_RUN="${DRY_RUN:-0}"
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
