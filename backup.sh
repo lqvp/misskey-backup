@@ -5,6 +5,9 @@
 #
 # 設定はスクリプトと同じディレクトリ (または /etc/misskey-backup) の
 # backup.env から読み込みます。backup.env.example をコピーして使ってください。
+#
+# テスト実行は DRY_RUN=1 を指定すると、ダンプ生成まで行い
+# アップロード・通知・削除をスキップします。
 
 set -o errexit
 set -o pipefail
@@ -40,9 +43,11 @@ BACKUP_DIR="/home/misskey/backup"
 MISSKEY_INSTANCE=""
 MISSKEY_TOKEN=""
 DISCORD_WEBHOOK_URL=""
+HEALTHCHECK_URL=""
 GDRIVE_PARENT_ID=""
 GDRIVE_PATH="./gdrive"
 RETENTION_DAYS=14
+DRY_RUN=0
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
@@ -55,9 +60,16 @@ export TZ="${TZ:-Asia/Tokyo}"
 TIMESTAMP="$(date +%Y%m%d%H%M%S)"
 BACKUP_FILE="${BACKUP_DIR}/${DB_NAME}_backup_${TIMESTAMP}.sql"
 LOG_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.log"
-ERROR_MESSAGE=""
 
 mkdir -p "$BACKUP_DIR"
+
+# ログファイルへの書き込み可否を先に確認（ディスクフル等の早期検出）
+if ! touch "$LOG_FILE" 2>/dev/null; then
+    echo "エラー: ログファイルに書き込めません: $LOG_FILE" >&2
+    exit 2
+fi
+
+# stdout/stderr をログにも残す（tee は bash のプロセス置換を使用）
 exec 3>&1 1> >(tee -a "$LOG_FILE") 2>&1
 
 log() {
@@ -67,11 +79,16 @@ log() {
 on_error() {
     local exit_code=$?
     local line_no=$1
-    ERROR_MESSAGE="行 ${line_no} でエラーが発生しました (exit code: ${exit_code})"
-    log "エラー: $ERROR_MESSAGE"
-    log "--- エラーログ ---"
-    cat "$LOG_FILE" >&2
-    notify_error "$ERROR_MESSAGE"
+    log "エラー: 行 ${line_no} でエラーが発生しました (exit code: ${exit_code})"
+    # tee への書き込みは非同期のため、直近のログ行がファイルに届くのを待つ
+    sleep 1
+    # healthchecks.io に失敗を報告（無音障害検知。設定時のみ）
+    if [[ -n "${HEALTHCHECK_URL:-}" && "$DRY_RUN" != "1" ]]; then
+        curl -sf -m 10 --retry 2 "${HEALTHCHECK_URL}/fail" >/dev/null || true
+    fi
+    if [[ "$DRY_RUN" != "1" ]]; then
+        notify_error "exit code: ${exit_code} (行 ${line_no})。詳細はサーバーのログを確認してください。"
+    fi
     exit "$exit_code"
 }
 trap 'on_error $LINENO' ERR
@@ -79,11 +96,15 @@ trap 'on_error $LINENO' ERR
 # ---------------------------------------------------------------------------
 # 二重起動防止（同一ホストで同時実行しない）
 # ---------------------------------------------------------------------------
-LOCK_FILE="${BACKUP_DIR}/backup.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    log "エラー: 別のバックアップが実行中です ($LOCK_FILE)"
-    exit 3
+if ! command -v flock >/dev/null 2>&1; then
+    log "警告: flock が見つからないため二重起動防止をスキップします"
+else
+    LOCK_FILE="${BACKUP_DIR}/backup.lock"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "エラー: 別のバックアップが実行中です ($LOCK_FILE)"
+        exit 3
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -92,7 +113,7 @@ fi
 post_json() {
     local url="$1" payload="$2"
     # 通知の失敗でバックアップ全体を止めない
-    curl -sf -m 30 -H "Content-Type: application/json" \
+    curl -sf -m 30 --retry 2 -H "Content-Type: application/json" \
         -X POST -d "$payload" "$url" >/dev/null || \
         log "警告: 通知の送信に失敗しました (${url})"
 }
@@ -126,8 +147,7 @@ notify_start() {
 notify_error() {
     local message="$1"
     notify_discord "⚠️ バックアップ中にエラーが発生しました。
-エラー内容: ${message}
-詳細はサーバーのログを確認してください。"
+エラー内容: ${message}"
     notify_misskey "⚠️ バックアップ中にエラーが発生しました。
 エラー内容: ${message}"
 }
@@ -135,12 +155,15 @@ notify_error() {
 # ---------------------------------------------------------------------------
 # バックアップ本体
 # ---------------------------------------------------------------------------
+# GNU stat / BSD stat の両方に対応
 get_file_size() {
     local file_path="$1"
-    if [[ -f "$file_path" ]]; then
+    if [[ ! -f "$file_path" ]]; then
+        echo 0
+    elif stat -c %s /dev/null >/dev/null 2>&1; then
         stat -c "%s" "$file_path"
     else
-        echo 0
+        stat -f %z "$file_path"
     fi
 }
 
@@ -156,6 +179,13 @@ create_backup() {
     local tmp_file="${BACKUP_FILE}.tmp"
 
     if ! docker exec "$DOCKER_CONTAINER_NAME" pg_dump -U "$DB_USER" "$DB_NAME" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # 空ダンプのガード（ディスクフル等でサイズ 0 や極小になるケース）
+    if [[ ! -s "$tmp_file" ]]; then
+        log "エラー: ダンプファイルが空です（ディスク容量を確認してください）"
         rm -f "$tmp_file"
         return 1
     fi
@@ -184,7 +214,7 @@ create_backup() {
 }
 
 # ---------------------------------------------------------------------------
-# Google Drive へのアップロード
+# Google Drive へのアップロード（MD5 検証つき）
 # ---------------------------------------------------------------------------
 upload_to_gdrive() {
     local backup_file="$1"
@@ -201,15 +231,36 @@ upload_to_gdrive() {
         return 1
     fi
     GDRIVE_OUTPUT="$gdrive_output"
+
+    # アップロード結果の MD5 をローカルファイルと照合し、破損を検出する
+    local remote_md5
+    remote_md5=$(echo "$gdrive_output" | grep "^MD5:" | awk '{print $2}')
+    if [[ -n "$remote_md5" ]]; then
+        local local_md5
+        if command -v md5sum >/dev/null 2>&1; then
+            local_md5=$(md5sum "$backup_file" | awk '{print $1}')
+        else
+            local_md5=$(md5 -q "$backup_file")
+        fi
+        if [[ "$remote_md5" != "$local_md5" ]]; then
+            log "エラー: アップロード後の MD5 が一致しません（ローカル: $local_md5 / リモート: $remote_md5）"
+            return 1
+        fi
+        log "MD5 検証に成功しました"
+    else
+        # 出力フォーマット変更で MD5 が取れない場合は検証をスキップ（エラーにはしない）
+        log "警告: gdrive の出力から MD5 を抽出できなかったため検証をスキップします"
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# 世代管理
+# 世代管理（ダンプとログファイルの両方を掃除する）
 # ---------------------------------------------------------------------------
 clean_old_backups() {
-    log "${RETENTION_DAYS} 日より古いバックアップを削除しています..."
+    # -mtime +N は「N+1 日以上経過」で削除される点に注意
+    log "${RETENTION_DAYS} 日より古いバックアップとログを削除しています..."
     find "$BACKUP_DIR" -type f \
-        \( -name "${DB_NAME}_backup_*.sql" -o -name "${DB_NAME}_backup_*.sql.gz" \) \
+        \( -name "${DB_NAME}_backup_*.sql" -o -name "${DB_NAME}_backup_*.sql.gz" -o -name "backup_*.log" \) \
         -mtime "+${RETENTION_DAYS}" -delete
     log "クリーンアップ完了"
 }
@@ -218,42 +269,62 @@ clean_old_backups() {
 # メイン処理
 # ---------------------------------------------------------------------------
 main() {
-    # 前回バックアップのサイズ（新規作成前に取得する）
-    # 圧縮/非圧縮でファイルサイズが大きく変わるため、同じ形式のファイルとだけ比較する
-    local last_backup=""
-    if [[ "${COMPRESS_DUMP:-1}" == "1" ]]; then
-        last_backup=$(ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql.gz 2>/dev/null | head -n 1 || true)
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY_RUN モード: ダンプ生成のみ行い、アップロード・通知・削除をスキップします"
     else
-        last_backup=$(ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql 2>/dev/null | head -n 1 || true)
+        notify_start
     fi
-    local last_size=0
-    [[ -n "$last_backup" ]] && last_size=$(get_file_size "$last_backup")
-
-    notify_start
 
     create_backup
 
-    local current_size
-    current_size=$(get_file_size "$BACKUP_FILE")
-    local size_diff=$((current_size - last_size))
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY_RUN モードのため、ここで終了します（アップロード・通知・削除は行いません）"
+        return 0
+    fi
 
     upload_to_gdrive "$BACKUP_FILE"
 
-    # gdrive の出力から作成日時とURLを抽出
+    # gdrive の出力から作成日時とURLを抽出（フォーマット変更時は警告のみ）
     local created_time
     created_time=$(echo "$GDRIVE_OUTPUT" | grep "Created:" | awk '{print $2" "$3}')
     local view_url
     view_url=$(echo "$GDRIVE_OUTPUT" | grep "ViewUrl:" | awk '{print $2}')
+    if [[ -z "$created_time" ]]; then
+        log "警告: gdrive の出力から作成日時を抽出できませんでした"
+        created_time="（抽出失敗）"
+    fi
+    if [[ -z "$view_url" ]]; then
+        log "警告: gdrive の出力から URL を抽出できませんでした"
+        view_url="（抽出失敗）"
+    fi
+
+    # 前回との差分サイズ（前回分が無い場合は表示しない。
+    # 圧縮/非圧縮でサイズが大きく変わるため、同じ形式のファイルとだけ比較する）
+    local size_diff_text=""
+    local last_backup=""
+    if [[ "${COMPRESS_DUMP:-1}" == "1" ]]; then
+        last_backup=$(LC_ALL=C ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql.gz 2>/dev/null | head -n 1 || true)
+    else
+        last_backup=$(LC_ALL=C ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql 2>/dev/null | head -n 1 || true)
+    fi
+    if [[ -n "$last_backup" ]]; then
+        size_diff_text="前回との差分サイズ: $(($(get_file_size "$BACKUP_FILE") - $(get_file_size "$last_backup"))) バイト
+"
+    fi
 
     notify_discord "✅ データベースのバックアップが完了しました。
-前回との差分サイズ: ${size_diff} バイト
-作成日時: ${created_time}
+${size_diff_text}作成日時: ${created_time}
 ダウンロードURL: ${view_url}"
     notify_misskey "✅ データベースのバックアップが完了しました。
-前回との差分サイズ: ${size_diff} バイト
-作成日時: ${created_time}"
+${size_diff_text}作成日時: ${created_time}"
 
     clean_old_backups
+
+    # healthchecks.io への生存報告（無音障害検知。設定時のみ）
+    if [[ -n "${HEALTHCHECK_URL:-}" ]]; then
+        curl -sf -m 10 --retry 2 "$HEALTHCHECK_URL" >/dev/null || \
+            log "警告: healthchecks.io への報告に失敗しました"
+    fi
 
     log "すべての処理が完了しました"
 }

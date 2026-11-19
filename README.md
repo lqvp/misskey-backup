@@ -10,8 +10,11 @@ Google Drive にアップロードして Discord / Misskey に通知するスク
 - `flock` による二重起動防止
 - ダンプの整合性チェック（ヘッダ・フッタ検証、失敗時の中途ファイル削除）
 - ダンプの gzip 圧縮に対応（`COMPRESS_DUMP`）
+- アップロード後の MD5 照合による破損検出
 - 通知の JSON 組み立てに `jq` を使用（メッセージ内の特殊文字で壊れない）
-- ログファイルをバックアップディレクトリに保存
+- ログファイルをバックアップディレクトリに保存（世代削除対象）
+- healthchecks.io 対応（`HEALTHCHECK_URL`）
+- リストアスクリプト [restore.sh](restore.sh) 同梱
 
 ## 必要なもの
 
@@ -21,26 +24,35 @@ Google Drive にアップロードして Discord / Misskey に通知するスク
 - `jq`（通知を使う場合）
 - `curl`
 
-## セットアップ
-
-```bash
-cp backup.env.example backup.env
-$EDITOR backup.env   # 値を環境に合わせて編集
-chmod 600 backup.env  # トークンを含むため
-chmod +x backup.sh
-```
-
 ## 実行
 
 ```bash
 ./backup.sh
 ```
 
-または cron で毎日 4 時に実行:
+テスト実行（ダンプ生成のみ、アップロード・通知・削除をスキップ）:
+
+```bash
+DRY_RUN=1 ./backup.sh
+```
+
+cron で毎日実行する例:
 
 ```
-0 4 * * * /home/misskey/backup.sh
+0 19 * * * /home/misskey/backup.sh
 ```
+
+注意: cron の時刻はサーバーのローカルタイムゾーンで解釈されます。
+サーバーが UTC の場合、`0 19 * * *` は JST 翌朝 4:00 の実行になります。
+
+## リストア
+
+```bash
+./restore.sh /home/misskey/backup/misskey_backup_YYYYMMDDHHMMSS.sql.gz
+```
+
+対話確認の後、`public` スキーマを作り直してダンプを復元します。
+自動化する場合は `--yes` を付けます。復元後は Misskey を再起動してください。
 
 既存環境からの移行は [MIGRATION.md](MIGRATION.md) を参照してください。
 
