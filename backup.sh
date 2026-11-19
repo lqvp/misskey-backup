@@ -216,8 +216,13 @@ clean_old_backups() {
 # ---------------------------------------------------------------------------
 main() {
     # 前回バックアップのサイズ（新規作成前に取得する）
+    # 圧縮/非圧縮でファイルサイズが大きく変わるため、同じ形式のファイルとだけ比較する
     local last_backup=""
-    last_backup=$(ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql* 2>/dev/null | head -n 1 || true)
+    if [[ "${COMPRESS_DUMP:-1}" == "1" ]]; then
+        last_backup=$(ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql.gz 2>/dev/null | head -n 1 || true)
+    else
+        last_backup=$(ls -t "$BACKUP_DIR/${DB_NAME}_backup_"*.sql 2>/dev/null | head -n 1 || true)
+    fi
     local last_size=0
     [[ -n "$last_backup" ]] && last_size=$(get_file_size "$last_backup")
 
@@ -231,16 +236,20 @@ main() {
 
     upload_to_gdrive "$BACKUP_FILE"
 
-    # gdrive の出力から作成日時を抽出
+    # gdrive の出力から作成日時とURLを抽出
     local created_time
     created_time=$(echo "$GDRIVE_OUTPUT" | grep "Created:" | awk '{print $2" "$3}')
+    local view_url
+    view_url=$(echo "$GDRIVE_OUTPUT" | grep "ViewUrl:" | awk '{print $2}')
 
     notify_discord "✅ データベースのバックアップが完了しました。
 前回との差分サイズ: ${size_diff} バイト
-作成日時: ${created_time}"
+作成日時: ${created_time}
+ダウンロードURL: ${view_url}"
     notify_misskey "✅ データベースのバックアップが完了しました。
 前回との差分サイズ: ${size_diff} バイト
-作成日時: ${created_time}"
+作成日時: ${created_time}
+ダウンロードURL: ${view_url}"
 
     clean_old_backups
 
