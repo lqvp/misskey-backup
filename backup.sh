@@ -248,8 +248,7 @@ main() {
 ダウンロードURL: ${view_url}"
     notify_misskey "✅ データベースのバックアップが完了しました。
 前回との差分サイズ: ${size_diff} バイト
-作成日時: ${created_time}
-ダウンロードURL: ${view_url}"
+作成日時: ${created_time}"
 
     clean_old_backups
 
